@@ -1,0 +1,4 @@
+# .gitignore (Automation 폴더 위치)
+.env
+**/__pycache__/
+.vscode/
