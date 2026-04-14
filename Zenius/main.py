@@ -50,11 +50,16 @@ class ZeniusAutomation:
         return webdriver.Chrome(service=Service(self.config["DRIVER_PATH"]), options=opts)
 
     def load_previous_data(self):
-        """전날 엑셀에서 마운트 경로별 사용량을 읽어옴"""
-        files = glob.glob(os.path.join(self.config["OUTPUT_PATH"], "HDI Unix 서버 모니터링 정보_*.xlsx"))
-        if not files: return
+        # 엑셀 파일만 필터링하고, 파일명이 일정한 형식이므로 정렬을 통해 가장 최신을 찾습니다.
+        files = [f for f in glob.glob(os.path.join(self.config["OUTPUT_PATH"], "HDI Unix 서버 모니터링 정보_*.xlsx")) 
+                 if "~$" not in f] # 엑셀 임시 파일 제외
+        if not files: 
+            print("ℹ️ 참조할 이전 데이터 파일이 없습니다.")
+            return
+            
         try:
-            latest = max(files, key=os.path.getctime)
+            # 파일명 날짜 기준으로 정렬하여 가장 마지막 파일 선택
+            latest = sorted(files)[-1] 
             print(f"📂 이전 데이터 참조: {os.path.basename(latest)}")
             with pd.ExcelFile(latest) as xls:
                 for sn in xls.sheet_names:
@@ -69,17 +74,28 @@ class ZeniusAutomation:
             print(f"⚠️ 이전 데이터 로드 실패: {e}")
 
     def _calculate_diff(self, curr, prev):
-        """숫자 차이 계산 (사용량 기준)"""
+        """전일 사용량과 당일 사용량의 순수 차이값만 반환"""
         try:
-            c = float(self.re_num.sub('', str(curr)) or 0)
-            p = float(self.re_num.sub('', str(prev)) or 0)
-            diff = round(c - p, 2)
+            # 단위(GB, MB 등)를 제외한 숫자만 추출하여 계산
+            c_val = float(self.re_num.sub('', str(curr)) or 0)
+            p_val = float(self.re_num.sub('', str(prev)) or 0)
             
-            unit = "GB" if "GB" in str(curr) else ("MB" if "MB" in str(curr) else "")
-            if diff > 0: return f"▲ {diff}{unit}"
-            elif diff < 0: return f"▼ {abs(diff)}{unit}"
-            return "(-)"
-        except: return "(-)"
+            diff = round(c_val - p_val, 2)
+            
+            # 원본 데이터에서 단위 추출 (없으면 빈 문자열)
+            unit = ""
+            if "GB" in str(curr): unit = "GB"
+            elif "MB" in str(curr): unit = "MB"
+            
+            if diff > 0:
+                return f"+{diff}{unit}"
+            elif diff < 0:
+                # abs()를 써서 -가 중복되지 않게 처리 (예: -0.5GB)
+                return f"{diff}{unit}" 
+            else:
+                return "0" # 변동 없음
+        except:
+            return "-" # 비교 불가 시
 
     def login(self):
         try:
@@ -110,7 +126,9 @@ class ZeniusAutomation:
                 server_link = self.wait.until(EC.element_to_be_clickable((By.LINK_TEXT, server)))
                 server_link.click()
                 
-                self.wait.until(lambda d: len(d.window_handles) > 1)
+                # --- 수정된 부분: lambda 대신 공식 EC 사용 ---
+                self.wait.until(EC.number_of_windows_to_be(2))
+                time.sleep(0.5) # 창 전환 직후 안정화를 위한 짧은 휴식
                 self.driver.switch_to.window(self.driver.window_handles[-1])
                 
                 # 기본 정보
