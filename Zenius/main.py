@@ -50,28 +50,60 @@ class ZeniusAutomation:
         return webdriver.Chrome(service=Service(self.config["DRIVER_PATH"]), options=opts)
 
     def load_previous_data(self):
-        # 엑셀 파일만 필터링하고, 파일명이 일정한 형식이므로 정렬을 통해 가장 최신을 찾습니다.
+        # 최신 파일 탐색
         files = [f for f in glob.glob(os.path.join(self.config["OUTPUT_PATH"], "HDI Unix 서버 모니터링 정보_*.xlsx")) 
-                 if "~$" not in f] # 엑셀 임시 파일 제외
+                 if "~$" not in f]
         if not files: 
             print("ℹ️ 참조할 이전 데이터 파일이 없습니다.")
+            self.prev_summary = {}
             return
             
         try:
-            # 파일명 날짜 기준으로 정렬하여 가장 마지막 파일 선택
-            latest = sorted(files)[-1] 
-            print(f"📂 이전 데이터 참조: {os.path.basename(latest)}")
+            # 파일명 날짜 기준 정렬 (최신 파일 선택)
+            latest = sorted(files, key=lambda x: re.findall(r'\d{8}', x), reverse=True)[0]
+            print(f"📂 가장 최근 데이터 참조: {os.path.basename(latest)}")
+            
+            self.prev_summary = {}
+            self.prev_fs = {}
+
             with pd.ExcelFile(latest) as xls:
                 for sn in xls.sheet_names:
-                    df = pd.read_excel(xls, sheet_name=sn)
-                    # 데이터 시작 지점(7행)부터 마운트경로와 사용량 추출
-                    fs_df = df.iloc[6:].copy()
-                    fs_df.columns = fs_df.iloc[0]
-                    fs_df = fs_df[1:]
-                    if "마운트경로" in fs_df.columns and "사용량" in fs_df.columns:
-                        self.prev_fs[sn.lower()] = dict(zip(fs_df["마운트경로"], fs_df["사용량"]))
+                    df = pd.read_excel(xls, sheet_name=sn, header=None)
+                    s_key = sn.strip().lower()
+
+                    # --- [상단 요약 정보 추출] 1~4행 부근 ---
+                    # 엑셀의 0~5행 사이에서 CPU, Physical, Swap 키워드가 있는 행을 찾아 데이터 매핑
+                    temp_summary = {}
+                    for i in range(min(len(df), 6)):
+                        row_vals = [str(v).strip() for v in df.iloc[i].values]
+                        if "CPU 사용률" in row_vals[0]: temp_summary["CPU"] = row_vals[1]
+                        elif "Physical Memory" in row_vals[0]: temp_summary["Phys"] = row_vals[1]
+                        elif "Swap Memory" in row_vals[0]: temp_summary["Swap"] = row_vals[1]
+                    
+                    if temp_summary:
+                        self.prev_summary[s_key] = temp_summary
+
+                    # --- [파일시스템 정보 추출] ---
+                    header_row_idx = -1
+                    for i in range(len(df)):
+                        if "마운트경로" in df.iloc[i].values:
+                            header_row_idx = i
+                            break
+                    
+                    if header_row_idx != -1:
+                        fs_df = df.iloc[header_row_idx:].copy()
+                        fs_df.columns = fs_df.iloc[0]
+                        fs_df = fs_df[1:]
+                        
+                        self.prev_fs[s_key] = {
+                            str(k).strip(): str(v).strip() 
+                            for k, v in zip(fs_df["마운트경로"], fs_df["사용량"]) 
+                            if pd.notna(k)
+                        }
         except Exception as e:
             print(f"⚠️ 이전 데이터 로드 실패: {e}")
+            self.prev_summary = {}
+            self.prev_fs = {}
 
     def _calculate_diff(self, curr, prev):
         """전일 사용량과 당일 사용량의 순수 차이값만 반환"""
@@ -157,35 +189,70 @@ class ZeniusAutomation:
                 if len(self.driver.window_handles) > 1: self.driver.close()
 
     def save_report(self):
-        if not self.results: return
+        if not self.results: 
+            print("⚠️ 수집된 데이터가 없어 리포트를 생성하지 않습니다.")
+            return
+            
         df = pd.DataFrame(self.results)
-        path = os.path.join(self.config["OUTPUT_PATH"], f"HDI Unix 서버 모니터링 정보_{datetime.now().strftime('%Y%m%d')}.xlsx")
+        # 오늘 날짜 파일명 생성
+        base_name = f"HDI Unix 서버 모니터링 정보_{datetime.now().strftime('%Y%m%d')}"
+        path = os.path.join(self.config["OUTPUT_PATH"], f"{base_name}.xlsx")
         
-        with pd.ExcelWriter(path, engine='openpyxl') as writer:
+        # 파일 열림 에러(PermissionError) 방지
+        try:
+            writer = pd.ExcelWriter(path, engine='openpyxl')
+        except PermissionError:
+            path = os.path.join(self.config["OUTPUT_PATH"], f"{base_name}_{datetime.now().strftime('%H%M%S')}.xlsx")
+            print(f"⚠️ 기존 파일이 열려 있어 새 이름으로 저장합니다: {os.path.basename(path)}")
+            writer = pd.ExcelWriter(path, engine='openpyxl')
+
+        with writer:
             for server in self.targets:
-                sn = server[:31]; s_key = server.lower()
+                sn = server[:31]
+                s_key = server.strip().lower()
+                
                 group = df[df["서버이름"] == server]
                 if group.empty: continue
 
-                # 상단 요약 (CPU/Mem)
-                summary = [{"항목": "CPU 사용률", "현재 수치": group.iloc[0]["CPU"], "전일 대비": "(-)"},
-                           {"항목": "Physical Memory", "현재 수치": group.iloc[0]["Phys"], "전일 대비": "(-)"},
-                           {"항목": "Swap Memory", "현재 수치": group.iloc[0]["Swap"], "전일 대비": "(-)"}]
-                pd.DataFrame(summary).to_excel(writer, sheet_name=sn, index=False)
+                # 현재 데이터 추출
+                curr_cpu = str(group["CPU"].values[0])
+                curr_phys = str(group["Phys"].values[0])
+                curr_swap = str(group["Swap"].values[0])
 
-                # 파일시스템 테이블 (증감 로직 포함)
+                # 이전 요약 데이터와 비교
+                p_sum = self.prev_summary.get(s_key, {})
+                diff_cpu = self._calculate_diff(curr_cpu, p_sum.get("CPU", "0"))
+                diff_phys = self._calculate_diff(curr_phys, p_sum.get("Phys", "0"))
+                diff_swap = self._calculate_diff(curr_swap, p_sum.get("Swap", "0"))
+
+                # 상단 요약 테이블 구성
+                summary_data = [
+                    {"항목": "CPU 사용률", "현재 수치": curr_cpu, "전일 대비": diff_cpu},
+                    {"항목": "Physical Memory", "현재 수치": curr_phys, "전일 대비": diff_phys},
+                    {"항목": "Swap Memory", "현재 수치": curr_swap, "전일 대비": diff_swap}
+                ]
+                pd.DataFrame(summary_data).to_excel(writer, sheet_name=sn, index=False)
+
+                # 파일시스템 테이블 구성
                 fs_table = []
                 prev_data = self.prev_fs.get(s_key, {})
+                
                 for _, r in group.iterrows():
-                    curr_u = r["사용"]
-                    prev_u = prev_data.get(r["경로"], "N/A")
+                    curr_u = str(r["사용"])
+                    curr_path = str(r["경로"]).strip()
+                    prev_u = prev_data.get(curr_path, "N/A")
+                    
                     fs_table.append({
-                        "파일시스템": r["FS"], "마운트경로": r["경로"], "전체용량": r["전체"],
-                        "사용량": curr_u, "사용률(현재)": r["율"],
+                        "파일시스템": r["FS"], 
+                        "마운트경로": r["경로"], 
+                        "전체용량": r["전체"],
+                        "사용량": curr_u, 
+                        "사용률(현재)": r["율"],
                         "전일 대비 증감": self._calculate_diff(curr_u, prev_u)
                     })
                 
                 pd.DataFrame(fs_table).to_excel(writer, sheet_name=sn, index=False, startrow=6)
+                
         print(f"✨ 리포트 생성 완료: {path}")
 
     def run(self):
