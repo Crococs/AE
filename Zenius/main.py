@@ -50,7 +50,6 @@ class ZeniusAutomation:
         return webdriver.Chrome(service=Service(self.config["DRIVER_PATH"]), options=opts)
 
     def load_previous_data(self):
-        # 최신 파일 탐색
         files = [f for f in glob.glob(os.path.join(self.config["OUTPUT_PATH"], "HDI Unix 서버 모니터링 정보_*.xlsx")) 
                  if "~$" not in f]
         if not files: 
@@ -59,7 +58,6 @@ class ZeniusAutomation:
             return
             
         try:
-            # 파일명 날짜 기준 정렬 (최신 파일 선택)
             latest = sorted(files, key=lambda x: re.findall(r'\d{8}', x), reverse=True)[0]
             print(f"📂 가장 최근 데이터 참조: {os.path.basename(latest)}")
             
@@ -69,10 +67,9 @@ class ZeniusAutomation:
             with pd.ExcelFile(latest) as xls:
                 for sn in xls.sheet_names:
                     df = pd.read_excel(xls, sheet_name=sn, header=None)
+                    # 이전 데이터 비교를 위해 서버 키 정규화
                     s_key = sn.strip().lower()
 
-                    # --- [상단 요약 정보 추출] 1~4행 부근 ---
-                    # 엑셀의 0~5행 사이에서 CPU, Physical, Swap 키워드가 있는 행을 찾아 데이터 매핑
                     temp_summary = {}
                     for i in range(min(len(df), 6)):
                         row_vals = [str(v).strip() for v in df.iloc[i].values]
@@ -83,7 +80,6 @@ class ZeniusAutomation:
                     if temp_summary:
                         self.prev_summary[s_key] = temp_summary
 
-                    # --- [파일시스템 정보 추출] ---
                     header_row_idx = -1
                     for i in range(len(df)):
                         if "마운트경로" in df.iloc[i].values:
@@ -106,28 +102,20 @@ class ZeniusAutomation:
             self.prev_fs = {}
 
     def _calculate_diff(self, curr, prev):
-        """전일 사용량과 당일 사용량의 순수 차이값만 반환"""
         try:
-            # 단위(GB, MB 등)를 제외한 숫자만 추출하여 계산
             c_val = float(self.re_num.sub('', str(curr)) or 0)
             p_val = float(self.re_num.sub('', str(prev)) or 0)
-            
             diff = round(c_val - p_val, 2)
             
-            # 원본 데이터에서 단위 추출 (없으면 빈 문자열)
             unit = ""
             if "GB" in str(curr): unit = "GB"
             elif "MB" in str(curr): unit = "MB"
             
-            if diff > 0:
-                return f"+{diff}{unit}"
-            elif diff < 0:
-                # abs()를 써서 -가 중복되지 않게 처리 (예: -0.5GB)
-                return f"{diff}{unit}" 
-            else:
-                return "0" # 변동 없음
+            if diff > 0: return f"▲{diff}{unit}"
+            elif diff < 0: return f"▼{abs(diff)}{unit}" 
+            else: return "0"
         except:
-            return "-" # 비교 불가 시
+            return "-"
 
     def login(self):
         try:
@@ -158,19 +146,16 @@ class ZeniusAutomation:
                 server_link = self.wait.until(EC.element_to_be_clickable((By.LINK_TEXT, server)))
                 server_link.click()
                 
-                # --- 수정된 부분: lambda 대신 공식 EC 사용 ---
                 self.wait.until(EC.number_of_windows_to_be(2))
-                time.sleep(0.5) # 창 전환 직후 안정화를 위한 짧은 휴식
+                time.sleep(1.0) 
                 self.driver.switch_to.window(self.driver.window_handles[-1])
                 
-                # 기본 정보
                 cpu = self.wait.until(EC.presence_of_element_located((By.ID, 'cpuArea_Utilization_str'))).text.strip()
                 phys = self.driver.find_element(By.CSS_SELECTOR, '#phyUsedGauge .half_grp_num').text.strip()
                 swap = self.driver.find_element(By.CSS_SELECTOR, '#swapUsedGauge .half_grp_num').text.strip()
                 
-                # 디스크 탭 클릭 및 데이터 로딩 대기
                 self.driver.find_element(By.ID, 'Disk').click()
-                time.sleep(3) # 데이터 로딩을 위해 넉넉히 대기
+                time.sleep(3) 
                 
                 rows = self.driver.find_elements(By.CSS_SELECTOR, "tr.ui-widget-content.jqgrow")
                 for row in rows:
@@ -194,11 +179,9 @@ class ZeniusAutomation:
             return
             
         df = pd.DataFrame(self.results)
-        # 오늘 날짜 파일명 생성
         base_name = f"HDI Unix 서버 모니터링 정보_{datetime.now().strftime('%Y%m%d')}"
         path = os.path.join(self.config["OUTPUT_PATH"], f"{base_name}.xlsx")
         
-        # 파일 열림 에러(PermissionError) 방지
         try:
             writer = pd.ExcelWriter(path, engine='openpyxl')
         except PermissionError:
@@ -208,33 +191,35 @@ class ZeniusAutomation:
 
         with writer:
             for server in self.targets:
-                sn = server[:31]
-                s_key = server.strip().lower()
+                # --- [수정 포인트] 시트 이름 금지 문자 제거 로직 ---
+                # 엑셀 시트 이름에 쓸 수 없는 문자: \ / * ? : [ ]
+                sn = re.sub(r'[\\/*?:\[\]]', '', server)
+                sn = sn[:31] # 최대 31자 제한
+                
+                # 이전 데이터 매칭용 키는 원본 서버명 기반 (또는 sn 기반으로 조정 가능)
+                s_key = sn.strip().lower()
                 
                 group = df[df["서버이름"] == server]
                 if group.empty: continue
 
-                # 현재 데이터 추출
                 curr_cpu = str(group["CPU"].values[0])
                 curr_phys = str(group["Phys"].values[0])
                 curr_swap = str(group["Swap"].values[0])
 
-                # 이전 요약 데이터와 비교
                 p_sum = self.prev_summary.get(s_key, {})
                 diff_cpu = self._calculate_diff(curr_cpu, p_sum.get("CPU", "0"))
                 diff_phys = self._calculate_diff(curr_phys, p_sum.get("Phys", "0"))
                 diff_swap = self._calculate_diff(curr_swap, p_sum.get("Swap", "0"))
 
-                # 상단 요약 테이블 구성
                 summary_data = [
                     {"항목": "CPU 사용률", "현재 수치": curr_cpu, "전일 대비": diff_cpu},
                     {"항목": "Physical Memory", "현재 수치": curr_phys, "전일 대비": diff_phys},
                     {"항목": "Swap Memory", "현재 수치": curr_swap, "전일 대비": diff_swap}
                 ]
+                # 시트 이름 sn 사용
                 pd.DataFrame(summary_data).to_excel(writer, sheet_name=sn, index=False)
 
-                # 파일시스템 테이블 구성
-                fs_table = []
+                fs_table_raw = []
                 prev_data = self.prev_fs.get(s_key, {})
                 
                 for _, r in group.iterrows():
@@ -242,16 +227,33 @@ class ZeniusAutomation:
                     curr_path = str(r["경로"]).strip()
                     prev_u = prev_data.get(curr_path, "N/A")
                     
-                    fs_table.append({
+                    try:
+                        raw_usage = float(str(r["율"]).replace('%', '').strip())
+                    except:
+                        raw_usage = -1
+
+                    fs_table_raw.append({
                         "파일시스템": r["FS"], 
-                        "마운트경로": r["경로"], 
+                        "마운트경로": curr_path, 
                         "전체용량": r["전체"],
                         "사용량": curr_u, 
                         "사용률(현재)": r["율"],
-                        "전일 대비 증감": self._calculate_diff(curr_u, prev_u)
+                        "전일 대비 증감": self._calculate_diff(curr_u, prev_u),
+                        "_sort_val": raw_usage 
                     })
                 
-                pd.DataFrame(fs_table).to_excel(writer, sheet_name=sn, index=False, startrow=6)
+                def fs_sort_key(item):
+                    path = item["마운트경로"].upper()
+                    usage = item["_sort_val"]
+                    if path == "ALL": return (0, 0)
+                    elif path == "/": return (1, 0)
+                    else: return (2, -usage)
+
+                fs_table_sorted = sorted(fs_table_raw, key=fs_sort_key)
+                final_fs_table = [{k: v for k, v in item.items() if k != "_sort_val"} for item in fs_table_sorted]
+                
+                # 시트 이름 sn 사용
+                pd.DataFrame(final_fs_table).to_excel(writer, sheet_name=sn, index=False, startrow=6)
                 
         print(f"✨ 리포트 생성 완료: {path}")
 

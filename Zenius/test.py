@@ -120,10 +120,10 @@ class ZeniusAutomation:
             elif "MB" in str(curr): unit = "MB"
             
             if diff > 0:
-                return f"+{diff}{unit}"
+                return f"▲{diff}{unit}"
             elif diff < 0:
                 # abs()를 써서 -가 중복되지 않게 처리 (예: -0.5GB)
-                return f"{diff}{unit}" 
+                return f"▼{abs(diff)}{unit}" 
             else:
                 return "0" # 변동 없음
         except:
@@ -195,7 +195,7 @@ class ZeniusAutomation:
             
         df = pd.DataFrame(self.results)
         # 오늘 날짜 파일명 생성
-        base_name = f"HDI Unix 서버 모니터링 정보_{datetime.now().strftime('%Y%m%d')}"
+        base_name = f"[TEST]HDI Unix 서버 모니터링 정보_{datetime.now().strftime('%Y%m%d')}"
         path = os.path.join(self.config["OUTPUT_PATH"], f"{base_name}.xlsx")
         
         # 파일 열림 에러(PermissionError) 방지
@@ -234,7 +234,7 @@ class ZeniusAutomation:
                 pd.DataFrame(summary_data).to_excel(writer, sheet_name=sn, index=False)
 
                 # 파일시스템 테이블 구성
-                fs_table = []
+                fs_table_raw = []
                 prev_data = self.prev_fs.get(s_key, {})
                 
                 for _, r in group.iterrows():
@@ -242,16 +242,44 @@ class ZeniusAutomation:
                     curr_path = str(r["경로"]).strip()
                     prev_u = prev_data.get(curr_path, "N/A")
                     
-                    fs_table.append({
+                    # 정렬을 위해 숫자로 변환된 사용률 값을 함께 보관 (예: 85% -> 85.0)
+                    try:
+                        raw_usage = float(str(r["율"]).replace('%', '').strip())
+                    except:
+                        raw_usage = -1 # 수치가 없을 경우 가장 아래로
+
+                    fs_table_raw.append({
                         "파일시스템": r["FS"], 
-                        "마운트경로": r["경로"], 
+                        "마운트경로": curr_path, 
                         "전체용량": r["전체"],
                         "사용량": curr_u, 
                         "사용률(현재)": r["율"],
-                        "전일 대비 증감": self._calculate_diff(curr_u, prev_u)
+                        "전일 대비 증감": self._calculate_diff(curr_u, prev_u),
+                        "_sort_val": raw_usage # 정렬을 위한 임시 필드
                     })
                 
-                pd.DataFrame(fs_table).to_excel(writer, sheet_name=sn, index=False, startrow=6)
+                # --- 정렬 로직 적용 ---
+                # 1순위: ALL, 2순위: /, 3순위: 나머지 사용률 내림차순
+                def fs_sort_key(item):
+                    path = item["마운트경로"].upper()
+                    usage = item["_sort_val"]
+                    if path == "ALL":
+                        return (0, 0)      # 가장 위
+                    elif path == "/":
+                        return (1, 0)      # 두 번째
+                    else:
+                        return (2, -usage) # 나머지는 사용률 내림차순
+
+                fs_table_sorted = sorted(fs_table_raw, key=fs_sort_key)
+
+                # 정렬용 임시 필드(_sort_val) 제거 후 최종 리스트 생성
+                final_fs_table = [
+                    {k: v for k, v in item.items() if k != "_sort_val"} 
+                    for item in fs_table_sorted
+                ]
+                
+                # 엑셀 저장 (상단 요약 정보와 겹치지 않게 startrow=6 유지)
+                pd.DataFrame(final_fs_table).to_excel(writer, sheet_name=sn, index=False, startrow=6)
                 
         print(f"✨ 리포트 생성 완료: {path}")
 
