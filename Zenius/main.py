@@ -112,8 +112,8 @@ class ZeniusAutomation:
             elif "MB" in str(curr): unit = "MB"
             
             if diff > 0: return f"▲{diff}{unit}"
-            elif diff < 0: return f"▼{abs(diff)}{unit}" 
-            else: return "0"
+            elif diff < 0: return f"▽{abs(diff)}{unit}" 
+            else: return "-"
         except:
             return "-"
 
